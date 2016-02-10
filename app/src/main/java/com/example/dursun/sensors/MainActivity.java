@@ -1,7 +1,9 @@
 package com.example.dursun.sensors;
 
 import android.Manifest;
+import android.app.AlertDialog;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.hardware.Sensor;
@@ -10,30 +12,32 @@ import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
 import android.location.Criteria;
 import android.location.Location;
+import android.location.LocationListener;
 import android.location.LocationManager;
-import android.location.LocationProvider;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkInfo;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
-import android.os.Looper;
 import android.provider.MediaStore;
+import android.provider.Settings;
 import android.support.design.widget.FloatingActionButton;
+import android.support.design.widget.NavigationView;
 import android.support.design.widget.Snackbar;
 import android.support.v4.app.ActivityCompat;
-import android.util.Log;
-import android.view.View;
-import android.support.design.widget.NavigationView;
 import android.support.v4.view.GravityCompat;
 import android.support.v4.widget.DrawerLayout;
 import android.support.v7.app.ActionBarDrawerToggle;
 import android.support.v7.app.AppCompatActivity;
 import android.support.v7.widget.Toolbar;
+import android.util.Log;
 import android.view.Menu;
 import android.view.MenuItem;
+import android.view.View;
 import android.widget.TextView;
 
 import java.io.File;
-import java.io.Serializable;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.List;
@@ -48,6 +52,8 @@ public class MainActivity extends AppCompatActivity
     private Sensor mSensor;
     private String TAG;
     private int mSensorType;
+    private LocationListener mLocationListener;
+    private NetworkProviderBroadcastReceiver mBroadcastReceiver;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -104,6 +110,10 @@ public class MainActivity extends AppCompatActivity
         lowPowerCriteria.setPowerRequirement(Criteria.POWER_LOW);
         lowPowerIntent.putExtra("criteria", lowPowerCriteria);
         menu.add("Low Power Location Info").setIcon(R.drawable.ic_menu_share).setIntent(lowPowerIntent);
+
+        Intent passiveLocationIntent = new Intent();
+        passiveLocationIntent.putExtra("passive", true);
+        menu.add("Passive Location Info").setIcon(R.drawable.ic_menu_slideshow).setIntent(passiveLocationIntent);
 
         MenuItem mi = menu.getItem(menu.size() - 1);
         mi.setTitle(mi.getTitle());
@@ -210,8 +220,11 @@ public class MainActivity extends AppCompatActivity
         Intent intent = item.getIntent();
         mSensorType = intent.getIntExtra(getString(R.string.sensorType), 0);
         Criteria criteria = intent.getParcelableExtra("criteria");
-        if (mSensorType != 0) {
+        boolean passive = intent.getBooleanExtra("passive", false);
+        cancelLocationSensor();
+        cancelSensor();
 
+        if (mSensorType != 0) {
             reclaimSensor();
         } else if (criteria != null) {
             LocationManager lm = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
@@ -219,16 +232,15 @@ public class MainActivity extends AppCompatActivity
             TextView contentText = (TextView) findViewById(R.id.contentText);
             StringBuilder sb = new StringBuilder();
             for (String providerName : providers) {
-                sb.append("Location Provider: ").append(providerName);
-//                LocationProvider provider = lm.getProvider(providerName);
-                lm.requestSingleUpdate(providerName, new MyLocationListener(providerName, contentText), null);
-                if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED && ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-                    sb.append("NO LOCATION INFO IS AVAILABLE");
-                }
-                Location lastKnownLocation = lm.getLastKnownLocation(providerName);
-                sb.append("Location INFO: ").append(MyLocationListener.locationToString(lastKnownLocation));
+                enableLocationListener(lm, contentText, sb, providerName);
             }
             contentText.setText(sb.toString());
+        } else if (passive) {
+            LocationManager lm = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED && ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                return true;
+            }
+            lm.requestLocationUpdates(LocationManager.PASSIVE_PROVIDER, 0, 0, new MyLocationListener("passive", (TextView) findViewById(R.id.contentText)));
         } else {
             startActivityForResult(intent, CAPTURE_IMAGE_ACTIVITY_REQUEST_CODE);
         }
@@ -239,8 +251,100 @@ public class MainActivity extends AppCompatActivity
         return true;
     }
 
+    public void enableLocationListener(LocationManager lm, TextView contentText, StringBuilder sb, String providerName) {
+        sb.append("Location Provider: ").append(providerName);
+        lm.requestSingleUpdate(providerName, new MyLocationListener(providerName, contentText), null);
+        mLocationListener = new MyLocationListener(providerName + "_Listener", contentText);
+        lm.requestLocationUpdates(providerName, 0, 0, mLocationListener);
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED && ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            sb.append("NO LOCATION INFO IS AVAILABLE");
+        }
+        if (confirmLocationProviderEnabled(lm, providerName)) {
+            Location lastKnownLocation = lm.getLastKnownLocation(providerName);
+            sb.append("Location INFO: ").append(MyLocationListener.locationToString(lastKnownLocation));
+            mBroadcastReceiver = new NetworkProviderBroadcastReceiver();
+            mBroadcastReceiver.start(this);
+        }
+    }
+
+    private boolean confirmLocationProviderEnabled(LocationManager lm, String provider) {
+        boolean confirmNetworkProviderEnabled = confirmNetworkProviderEnabled(lm, provider);
+        boolean confirmAirplaneModeIsOff = confirmAirplaneModeIsOff();
+        boolean confirmWifiAvailable = confirmWifiAvailable();
+        Log.d(TAG, "confirmNetworkProviderEnabled: " + confirmNetworkProviderEnabled + ", confirmAirplaneModeIsOff:" + confirmAirplaneModeIsOff + ", confirmWifiAvailable:" + confirmWifiAvailable);
+        return confirmNetworkProviderEnabled && confirmAirplaneModeIsOff && confirmWifiAvailable;
+    }
+
+    private boolean confirmWifiAvailable() {
+        ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+        boolean available = false;
+
+        Network[] allNetworks = cm.getAllNetworks();
+        for (Network network : allNetworks) {
+            NetworkInfo cmNetworkInfo = cm.getNetworkInfo(network);
+            Log.d(TAG, "onReceive: NetworkInfo: " + cmNetworkInfo.getTypeName() + ", " + cmNetworkInfo.isAvailable());
+            if (cmNetworkInfo.getType() == ConnectivityManager.TYPE_WIFI) {
+                available = cmNetworkInfo.isAvailable();
+            }
+        }
+
+        if (!available) {
+            showAlertDialog("WIFI is not available", "Please enable wifi");
+        }
+        return available;
+    }
+
+    private void showAlertDialog(String title, String message) {
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        AlertDialog alertDialog = builder.create();
+        alertDialog.setTitle(title);
+        alertDialog.setMessage(message);
+        DialogInterface.OnClickListener listener = new DialogInterface.OnClickListener() {
+            @Override
+            public void onClick(DialogInterface dialogInterface, int i) {
+                Log.d(TAG, "DONE....");
+            }
+        };
+        alertDialog.setButton(AlertDialog.BUTTON_NEUTRAL, "OK", listener);
+        alertDialog.show();
+    }
+
+    private boolean confirmAirplaneModeIsOff() {
+        boolean isOff = Settings.System.getInt(getContentResolver(), Settings.Global.AIRPLANE_MODE_ON, 0) == 0;
+        if (!isOff) {
+            showAlertDialog("Airplane mode on", "Please turn off airplane mode");
+        }
+        return isOff;
+    }
+
+    private boolean confirmNetworkProviderEnabled(LocationManager lm, String provider) {
+
+        boolean providerEnabled = lm.isProviderEnabled(provider);
+        if (!providerEnabled) {
+            showAlertDialog("Location Provider(" + provider + ") is not available", "Please enable location provider!");
+        }
+        return providerEnabled;
+    }
+
+    public void cancelLocationSensor() {
+        if (mLocationListener != null) {
+            Log.d(TAG, "Cancelling Active Location Listener: " + mLocationListener);
+            LocationManager lm = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED &&
+                    ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                Log.d(TAG, "Location Listener is not activated.");
+                return;
+            }
+            lm.removeUpdates(mLocationListener);
+            mLocationListener = null;
+            if (mBroadcastReceiver != null) {
+                mBroadcastReceiver.stop(this);
+                mBroadcastReceiver = null;
+            }
+        }
+    }
+
     private void reclaimSensor() {
-        cancelSensor();
         if (mSensorType != 0) {
             Log.d(TAG, "Sensor Type:" + mSensorType);
             mSensor = mSensorManager.getDefaultSensor(mSensorType);
@@ -273,6 +377,7 @@ public class MainActivity extends AppCompatActivity
     protected void onPause() {
         super.onPause();
         cancelSensor();
+        cancelLocationSensor();
     }
 
     @Override
